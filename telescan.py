@@ -60,6 +60,15 @@ except ImportError:
     OpenTeleException = TFileNotFound = None  # type: ignore
     OPENTELE_AVAILABLE = False
 
+
+if OPENTELE_AVAILABLE:
+    OpenTeleBaseException = OpenTeleException  # type: ignore[assignment]
+else:
+    class OpenTeleBaseException(Exception):
+        """Заглушка для ситуаций без установленного opentele."""
+
+        pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s - %(levelname)s] %(message)s",
@@ -562,6 +571,16 @@ def make_isolated_tdata_copy(src: Path, account_dirname: str) -> Path:
     return dst
 
 
+def format_opentele_error(exc: BaseException) -> str:
+    """Возвращает человеко-понятное описание исключения opentele."""
+
+    if OPENTELE_AVAILABLE and TFileNotFound is not None and isinstance(exc, TFileNotFound):
+        detail = getattr(exc, "message", None)
+        suffix = f": {detail}" if detail else ""
+        return "Не найден ключ key_data (папка tdata неполная или повреждена)" + suffix
+    return str(exc)
+
+
 def discover_keyfile_candidates(tdata_path: Path) -> List[str]:
     """Возвращает возможные значения keyFile для TDesktop."""
 
@@ -591,7 +610,7 @@ def discover_keyfile_candidates(tdata_path: Path) -> List[str]:
 def load_tdesktop_with_fallbacks(tdata_path: Path) -> TDesktop:
     """Пытается загрузить tdata, перебирая доступные варианты keyFile."""
 
-    last_error: Optional[Exception] = None
+    last_error: Optional[BaseException] = None
     tried: List[Optional[str]] = []
 
     keyfile_candidates = [None] + discover_keyfile_candidates(tdata_path)
@@ -607,16 +626,24 @@ def load_tdesktop_with_fallbacks(tdata_path: Path) -> TDesktop:
             if tdesk.isLoaded():
                 return tdesk
             last_error = RuntimeError("TDesktop не загрузил данные tdata")
-        except Exception as exc:  # pragma: no cover - защитный блок
-            if OPENTELE_AVAILABLE and isinstance(exc, TFileNotFound):
+        except OpenTeleBaseException as exc:  # pragma: no cover - защитный блок
+            if OPENTELE_AVAILABLE and TFileNotFound is not None and isinstance(exc, TFileNotFound):
                 last_error = exc
                 continue
+            last_error = exc
+            break
+        except Exception as exc:  # pragma: no cover - защитный блок
             last_error = exc
             break
 
     if last_error is None:
         raise RuntimeError("Не удалось загрузить tdata: не найдены ключи шифрования")
-    raise RuntimeError(f"Не удалось загрузить tdata: {last_error}") from last_error
+    message = (
+        format_opentele_error(last_error)
+        if isinstance(last_error, OpenTeleBaseException)
+        else str(last_error)
+    )
+    raise RuntimeError(f"Не удалось загрузить tdata: {message}") from last_error
 
 
 async def convert_account_async(tdata_copy: Path, out_session: Path) -> None:
@@ -655,6 +682,10 @@ async def _convert_tdata_worker(
         except asyncio.TimeoutError:
             status = "timeout"
             error = f"Конвертация превысила таймаут {timeout} сек"
+        except OpenTeleBaseException as exc:
+            status = "error"
+            error = format_opentele_error(exc)
+            logging.error("Ошибка конвертации tdata (%s): %s", account, error)
         except Exception as exc:
             status = "error"
             error = str(exc)
