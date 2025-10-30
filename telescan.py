@@ -65,6 +65,168 @@ logging.basicConfig(
 )
 
 
+DEFAULT_CONFIG_PATH = Path("telescan.toml")
+
+
+def _read_toml_file(path: Path) -> Dict[str, Any]:
+    """Читает TOML файл, подсказывая об отсутствующих зависимостях."""
+
+    try:  # Python 3.11+
+        import tomllib  # type: ignore[attr-defined]
+    except ModuleNotFoundError:  # pragma: no cover - fallback для Python < 3.11
+        try:
+            import tomli as tomllib  # type: ignore
+        except ModuleNotFoundError as exc:  # pragma: no cover - информативная ошибка
+            raise SystemExit(
+                "[ERROR] Для чтения конфигурации нужен пакет tomli: pip install tomli"
+            ) from exc
+
+    with path.open("rb") as handle:
+        return tomllib.load(handle)
+
+
+def resolve_config_path(argv: Sequence[str]) -> Optional[Path]:
+    """Определяет, какой файл конфигурации следует использовать."""
+
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config")
+    known_args, _ = config_parser.parse_known_args(argv)
+
+    if known_args.config:
+        explicit = Path(known_args.config).expanduser()
+        if not explicit.exists():
+            raise SystemExit(f"[ERROR] Конфигурационный файл не найден: {explicit}")
+        return explicit
+
+    if DEFAULT_CONFIG_PATH.exists():
+        return DEFAULT_CONFIG_PATH
+
+    return None
+
+
+def load_config(path: Optional[Path]) -> Dict[str, Any]:
+    """Загружает конфигурацию из TOML файла (или возвращает пустую)."""
+
+    if path is None:
+        return {}
+
+    try:
+        data = _read_toml_file(path)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"[ERROR] Конфигурационный файл не найден: {path}") from exc
+    except OSError as exc:
+        raise SystemExit(f"[ERROR] Не удалось прочитать конфигурацию: {exc}") from exc
+    except Exception as exc:  # pragma: no cover - защита от неожиданных ошибок парсинга
+        raise SystemExit(f"[ERROR] Ошибка при разборе конфигурации: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise SystemExit(
+            "[ERROR] Конфигурационный файл должен содержать TOML таблицу верхнего уровня"
+        )
+
+    return data
+
+
+def _config_section(config: Dict[str, Any], name: str) -> Dict[str, Any]:
+    """Извлекает раздел конфигурации, гарантируя корректный тип."""
+
+    value = config.get(name, {})
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        logging.warning("Раздел [%s] в конфигурации должен быть таблицей", name)
+        return {}
+    return dict(value)
+
+
+def _config_str(
+    section_name: str,
+    section: Dict[str, Any],
+    key: str,
+    default: Optional[str],
+) -> Optional[str]:
+    if key not in section:
+        return default
+    value = section[key]
+    if value is None:
+        return None
+    if isinstance(value, (str, Path)):
+        return str(value)
+    logging.warning(
+        "Значение %s.%s должно быть строкой, найдено %r. Используется %r",
+        section_name,
+        key,
+        value,
+        default,
+    )
+    return default
+
+
+def _config_int(section_name: str, section: Dict[str, Any], key: str, default: int) -> int:
+    if key not in section:
+        return default
+    value = section[key]
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logging.warning(
+            "Значение %s.%s должно быть целым числом, найдено %r. Используется %r",
+            section_name,
+            key,
+            value,
+            default,
+        )
+        return default
+
+
+def _config_float(section_name: str, section: Dict[str, Any], key: str, default: float) -> float:
+    if key not in section:
+        return default
+    value = section[key]
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logging.warning(
+            "Значение %s.%s должно быть числом, найдено %r. Используется %r",
+            section_name,
+            key,
+            value,
+            default,
+        )
+        return default
+
+
+def _config_bool(section_name: str, section: Dict[str, Any], key: str, default: bool) -> bool:
+    if key not in section:
+        return default
+    value = section[key]
+    if isinstance(value, bool):
+        return value
+    logging.warning(
+        "Значение %s.%s должно быть логическим, найдено %r. Используется %r",
+        section_name,
+        key,
+        value,
+        default,
+    )
+    return default
+
+
+def apply_logging_config(config: Dict[str, Any]) -> None:
+    """Применяет настройки логирования из конфигурации."""
+
+    logging_cfg = _config_section(config, "logging")
+    level = _config_str("logging", logging_cfg, "level", None)
+    if not level:
+        return
+    level_name = str(level).upper()
+    level_value = logging._nameToLevel.get(level_name)
+    if level_value is None:
+        logging.warning("Неизвестный уровень логирования в конфиге: %s", level)
+        return
+    logging.getLogger().setLevel(level_value)
+
+
 try:  # pragma: no cover - опциональная зависимость
     import socks
 except ImportError:  # pragma: no cover
@@ -935,11 +1097,23 @@ async def run_checker(
 # ---------------------------------------------------------------------------
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(
+    config: Optional[Dict[str, Any]] = None,
+    config_path: Optional[Path] = None,
+) -> argparse.ArgumentParser:
+    cfg = config or {}
+    check_cfg = _config_section(cfg, "check")
+    convert_cfg = _config_section(cfg, "convert")
+
     parser = argparse.ArgumentParser(
         prog="telescan",
         description="Универсальный инструмент работы с Telegram сессиями",
         formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "--config",
+        default=str(config_path) if config_path else None,
+        help="Путь к конфигурационному файлу TOML",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -954,36 +1128,98 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         help="Пути к источникам (.session, директориям, CSV, tdata)",
     )
-    check_parser.add_argument("--apis", required=True, help="JSON файл с API ключами")
-    check_parser.add_argument("--proxies", help="Файл со списком прокси")
+
+    check_apis_default = _config_str("check", check_cfg, "apis", None)
+    check_parser.add_argument(
+        "--apis",
+        required=check_apis_default is None,
+        default=check_apis_default,
+        help="JSON файл с API ключами",
+    )
+
+    check_proxies_default = _config_str("check", check_cfg, "proxies", None)
+    check_parser.add_argument(
+        "--proxies",
+        default=check_proxies_default,
+        help="Файл со списком прокси",
+    )
+
+    check_proxy_strategy_default = _config_str("check", check_cfg, "proxy_strategy", "round")
     check_parser.add_argument(
         "--proxy-strategy",
         choices=["round", "random", "sticky"],
-        default="round",
+        default=check_proxy_strategy_default,
         help="Стратегия выбора прокси",
     )
+
+    concurrency_default = _config_int("check", check_cfg, "concurrency", 20)
     check_parser.add_argument(
         "-c",
         "--concurrency",
         type=int,
-        default=20,
+        default=concurrency_default,
         help="Количество одновременных проверок (1-50)",
     )
-    check_parser.add_argument("--max-attempts", type=int, default=3, help="Повторы при ошибках")
-    check_parser.add_argument("--connect-timeout", type=int, default=20, help="Таймаут подключения")
-    check_parser.add_argument("--backoff-base", type=float, default=1.7, help="Основание backoff")
-    check_parser.add_argument("--rate-delay", type=float, default=0.3, help="Задержка перед запросами")
-    check_parser.add_argument("--out", default="./reports/report.csv", help="Путь к CSV отчёту")
-    check_parser.add_argument("--dry-run", action="store_true", help="Без реальных запросов")
+
+    check_parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=_config_int("check", check_cfg, "max_attempts", 3),
+        help="Повторы при ошибках",
+    )
+    check_parser.add_argument(
+        "--connect-timeout",
+        type=int,
+        default=_config_int("check", check_cfg, "connect_timeout", 20),
+        help="Таймаут подключения",
+    )
+    check_parser.add_argument(
+        "--backoff-base",
+        type=float,
+        default=_config_float("check", check_cfg, "backoff_base", 1.7),
+        help="Основание backoff",
+    )
+    check_parser.add_argument(
+        "--rate-delay",
+        type=float,
+        default=_config_float("check", check_cfg, "rate_delay", 0.3),
+        help="Задержка перед запросами",
+    )
+    check_parser.add_argument(
+        "--out",
+        default=_config_str("check", check_cfg, "out", "./reports/report.csv"),
+        help="Путь к CSV отчёту",
+    )
+    check_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=_config_bool("check", check_cfg, "dry_run", False),
+        help="Без реальных запросов",
+    )
 
     check_parser.add_argument(
         "--convert-out",
-        default="./converted_sessions",
+        default=_config_str("check", check_cfg, "convert_out", "./converted_sessions"),
         help="Папка для сохранения конвертированных из tdata сессий",
     )
-    check_parser.add_argument("--convert-timeout", type=int, default=60, help="Таймаут конвертации tdata")
-    check_parser.add_argument("--convert-parallel", type=int, default=2, help="Параллелизм конвертации tdata")
-    check_parser.add_argument("--keep-temp", action="store_true", help="Не удалять временные копии tdata")
+    check_parser.add_argument(
+        "--convert-timeout",
+        type=int,
+        default=_config_int("check", check_cfg, "convert_timeout", 60),
+        help="Таймаут конвертации tdata",
+    )
+    check_parser.add_argument(
+        "--convert-parallel",
+        type=int,
+        default=_config_int("check", check_cfg, "convert_parallel", 2),
+        help="Параллелизм конвертации tdata",
+    )
+    check_parser.add_argument(
+        "--keep-temp",
+        action="store_true",
+        default=_config_bool("check", check_cfg, "keep_temp", False),
+        help="Не удалять временные копии tdata",
+    )
 
     # --- CONVERT ---
     convert_parser = subparsers.add_parser(
@@ -997,11 +1233,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Направление конвертации",
     )
     convert_parser.add_argument("input", help="Путь к исходным данным")
-    convert_parser.add_argument("--output", required=True, help="Директория для результата")
-    convert_parser.add_argument("--timeout", type=int, default=60, help="Таймаут на единицу работы")
-    convert_parser.add_argument("--parallel", type=int, default=4, help="Параллелизм (1-8)")
-    convert_parser.add_argument("--keep-temp", action="store_true", help="Не удалять временные tdata (только tdata→session)")
-    convert_parser.add_argument("--apis", help="JSON с API ключами (нужно для session→tdata)")
+
+    convert_output_default = _config_str("convert", convert_cfg, "output", None)
+    convert_parser.add_argument(
+        "--output",
+        required=convert_output_default is None,
+        default=convert_output_default,
+        help="Директория для результата",
+    )
+    convert_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=_config_int("convert", convert_cfg, "timeout", 60),
+        help="Таймаут на единицу работы",
+    )
+    convert_parser.add_argument(
+        "--parallel",
+        type=int,
+        default=_config_int("convert", convert_cfg, "parallel", 4),
+        help="Параллелизм (1-8)",
+    )
+    convert_parser.add_argument(
+        "--keep-temp",
+        action="store_true",
+        default=_config_bool("convert", convert_cfg, "keep_temp", False),
+        help="Не удалять временные tdata (только tdata→session)",
+    )
+    convert_parser.add_argument(
+        "--apis",
+        default=_config_str("convert", convert_cfg, "apis", None),
+        help="JSON с API ключами (нужно для session→tdata)",
+    )
 
     return parser
 
@@ -1091,8 +1353,24 @@ async def handle_convert(args: argparse.Namespace) -> int:
 
 
 async def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    argv_list = list(argv) if argv is not None else sys.argv[1:]
+
+    config_path = resolve_config_path(argv_list)
+    config_data = load_config(config_path)
+
+    parser = build_parser(config_data, config_path)
+    args = parser.parse_args(argv_list)
+
+    final_config_path: Optional[Path]
+    if args.config:
+        final_config_path = Path(args.config).expanduser()
+    else:
+        final_config_path = config_path
+
+    if final_config_path and (config_path is None or final_config_path != config_path):
+        config_data = load_config(final_config_path)
+
+    apply_logging_config(config_data)
 
     if args.command == "check":
         return await handle_check(args)
