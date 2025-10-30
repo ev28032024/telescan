@@ -33,7 +33,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
 try:
@@ -445,6 +445,70 @@ def detect_source(path: Path) -> SourceItem:
 
 
 # ---------------------------------------------------------------------------
+# Recursive source discovery
+# ---------------------------------------------------------------------------
+
+
+def discover_sources(root: Path) -> List[SourceItem]:
+    """Рекурсивно находит поддерживаемые источники внутри каталога."""
+
+    path = root.expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"Источник '{path}' не найден")
+
+    sources: List[SourceItem] = []
+    seen: Set[Path] = set()
+
+    def add(item: SourceItem) -> None:
+        try:
+            resolved = item.path.resolve()
+        except OSError:
+            resolved = item.path
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        sources.append(item)
+
+    def walk(current: Path) -> None:
+        if current.is_symlink():
+            return
+        if current.is_file():
+            suffix = current.suffix.lower()
+            if suffix == ".session":
+                add(SourceItem(current, SourceType.TELETHON_SESSION_FILE, current.stem))
+            elif suffix in {".csv", ".txt"}:
+                add(SourceItem(current, SourceType.STRING_SESSION_CSV, current.stem))
+            return
+
+        if looks_like_tdata(current):
+            add(SourceItem(current, SourceType.TDATA_DIRECTORY, current.name))
+            return
+
+        try:
+            entries = sorted(current.iterdir(), key=lambda p: p.name.lower())
+        except OSError as exc:
+            logging.warning("Не удалось перечислить %s: %s", current, exc)
+            return
+
+        for entry in entries:
+            if entry.is_dir():
+                walk(entry)
+            elif entry.is_file():
+                suffix = entry.suffix.lower()
+                if suffix == ".session":
+                    add(SourceItem(entry, SourceType.TELETHON_SESSION_FILE, entry.stem))
+                elif suffix in {".csv", ".txt"}:
+                    add(SourceItem(entry, SourceType.STRING_SESSION_CSV, entry.stem))
+
+    if path.is_file():
+        add(detect_source(path))
+    else:
+        walk(path)
+
+    return sources
+
+
+# ---------------------------------------------------------------------------
 # tdata -> Telethon session
 # ---------------------------------------------------------------------------
 
@@ -711,7 +775,7 @@ async def convert_sessions_directory(
     concurrency: int,
     timeout: int,
 ) -> List[ConversionResult]:
-    session_files = sorted(p for p in sessions_dir.glob("*.session") if p.is_file())
+    session_files = list_session_files(sessions_dir)
     if not session_files:
         logging.warning("В директории %s не найдено файлов .session", sessions_dir)
         return []
@@ -954,7 +1018,12 @@ async def check_session_async(
 def list_session_files(folder: Path) -> List[Path]:
     if not folder.is_dir():
         raise FileNotFoundError(f"Директория {folder} не найдена")
-    return sorted(p for p in folder.glob("*.session") if p.is_file())
+    session_files: List[Path] = []
+    for candidate in folder.rglob("*"):
+        if candidate.is_file() and candidate.suffix.lower() == ".session":
+            session_files.append(candidate)
+    session_files.sort()
+    return session_files
 
 
 def load_string_sessions_csv(path: Path) -> List[Tuple[str, str]]:
@@ -1338,31 +1407,59 @@ def build_parser(
 async def handle_check(args: argparse.Namespace) -> int:
     args.concurrency = max(1, min(50, args.concurrency))
     sources: List[SourceItem] = []
+    seen_paths: Set[Path] = set()
+
+    def add_source(item: SourceItem) -> None:
+        try:
+            resolved = item.path.resolve()
+        except OSError:
+            resolved = item.path
+        if resolved in seen_paths:
+            return
+        seen_paths.add(resolved)
+        sources.append(item)
+
+    def extend_with_path(raw: str, only_tdata: bool = False) -> None:
+        path = Path(raw).expanduser()
+        if only_tdata and not path.is_dir():
+            logging.error("Каталог с tdata не найден: %s", path)
+            return
+        try:
+            discovered = discover_sources(path)
+        except FileNotFoundError:
+            logging.error("Источник %s не найден", path)
+            return
+        except Exception as exc:
+            logging.error("Не удалось обработать источник %s: %s", raw, exc)
+            return
+
+        added = 0
+        for item in discovered:
+            if only_tdata and item.type != SourceType.TDATA_DIRECTORY:
+                continue
+            add_source(item)
+            added += 1
+
+        if added == 0:
+            if only_tdata:
+                logging.warning(
+                    "В каталоге %s не найдено поддиректорий, похожих на tdata",
+                    path,
+                )
+            else:
+                logging.warning(
+                    "Источник %s не содержит поддерживаемых файлов", path
+                )
+
     all_inputs = list(args.inputs)
     if args.session_dir:
         all_inputs.append(args.session_dir)
 
     for raw in all_inputs:
-        try:
-            sources.append(detect_source(Path(raw)))
-        except Exception as exc:
-            logging.error("Не удалось обработать источник %s: %s", raw, exc)
+        extend_with_path(raw)
 
     if args.tdata_root:
-        tdata_root = Path(args.tdata_root)
-        if not tdata_root.is_dir():
-            logging.error("Каталог с tdata не найден: %s", tdata_root)
-        else:
-            added = 0
-            for entry in sorted(tdata_root.iterdir()):
-                if entry.is_dir() and looks_like_tdata(entry):
-                    sources.append(SourceItem(entry, SourceType.TDATA_DIRECTORY, entry.name))
-                    added += 1
-            if added == 0:
-                logging.warning(
-                    "В каталоге %s не найдено поддиректорий, похожих на tdata",
-                    tdata_root,
-                )
+        extend_with_path(args.tdata_root, only_tdata=True)
 
     if not sources:
         logging.error("Не найдено корректных источников для проверки")
@@ -1390,25 +1487,54 @@ async def handle_check(args: argparse.Namespace) -> int:
 
 async def handle_convert(args: argparse.Namespace) -> int:
     mode = args.mode
-    input_path = Path(args.input)
-    output_dir = Path(args.output)
+    input_path = Path(args.input).expanduser()
+    output_dir = Path(args.output).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     if mode == "tdata-to-session":
-        if not looks_like_tdata(input_path):
-            logging.error("%s не похож на директорию tdata", input_path)
+        if not input_path.exists():
+            logging.error("Каталог %s не найден", input_path)
             return 1
-        results = await convert_tdata_directory(
-            input_path,
-            output_dir,
-            args.timeout,
-            args.keep_temp,
-            max(1, min(args.parallel, 8)),
-        )
+        if input_path.is_file():
+            logging.error("Для конвертации tdata требуется указать директорию: %s", input_path)
+            return 1
+
+        input_is_tdata = looks_like_tdata(input_path)
+        if input_is_tdata:
+            tdata_dirs = [input_path]
+        else:
+            try:
+                discovered = discover_sources(input_path)
+            except Exception as exc:
+                logging.error("Не удалось разобрать каталог %s: %s", input_path, exc)
+                return 1
+            tdata_dirs = [item.path for item in discovered if item.type == SourceType.TDATA_DIRECTORY]
+
+        if not tdata_dirs:
+            logging.error("В %s не найдено поддиректорий, похожих на tdata", input_path)
+            return 1
+
+        parallel = max(1, min(args.parallel, 8))
+        multi_output = len(tdata_dirs) > 1 or not input_is_tdata
+        results: List[ConversionResult] = []
+        for tdata_dir in tdata_dirs:
+            target_output = output_dir if not multi_output else output_dir / tdata_dir.name
+            sub_results = await convert_tdata_directory(
+                tdata_dir,
+                target_output,
+                args.timeout,
+                args.keep_temp,
+                parallel,
+            )
+            results.extend(sub_results)
     else:
         if not args.apis:
             logging.error("Для конвертации session→tdata требуется указать --apis")
             return 1
         api_pairs = load_api_pairs(args.apis)
+        if not input_path.exists():
+            logging.error("Источник %s не найден", input_path)
+            return 1
         if input_path.is_file() and input_path.suffix == ".session":
             session_dir = Path(tempfile.mkdtemp(prefix="session_single_"))
             shutil.copy2(input_path, session_dir / input_path.name)
@@ -1430,7 +1556,6 @@ async def handle_convert(args: argparse.Namespace) -> int:
                 shutil.rmtree(cleanup_dir, ignore_errors=True)
 
     summary_path = output_dir / "convert_report.json"
-    output_dir.mkdir(parents=True, exist_ok=True)
     with summary_path.open("w", encoding="utf-8") as handle:
         json.dump([asdict(item) for item in results], handle, ensure_ascii=False, indent=2)
     ok_count = sum(1 for item in results if item.status == "ok")
