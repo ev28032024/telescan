@@ -540,15 +540,22 @@ def detect_account_dirs(tdata_path: Path) -> List[str]:
     }
 
     candidates: List[str] = []
+    fallback: List[str] = []
     for entry in sorted(tdata_path.iterdir()):
-        if entry.is_dir() and entry.name not in shared and len(entry.name) >= 16:
+        if not entry.is_dir() or entry.name in shared:
+            continue
+        if len(entry.name) >= 16:
             candidates.append(entry.name)
+        else:
+            fallback.append(entry.name)
 
-    if not candidates:
-        for entry in sorted(tdata_path.iterdir()):
-            if entry.is_dir() and entry.name not in shared:
-                candidates.append(entry.name)
-    return candidates
+    if candidates:
+        for name in fallback:
+            if name not in candidates:
+                candidates.append(name)
+        return candidates
+
+    return fallback
 
 
 def make_isolated_tdata_copy(src: Path, account_dirname: str) -> Path:
