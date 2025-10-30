@@ -52,10 +52,12 @@ except ImportError as exc:
 
 try:  # pragma: no cover - опциональная зависимость
     from opentele.api import UseCurrentSession
+    from opentele.exception import OpenTeleException, TFileNotFound
     from opentele.td import TDesktop
 
     OPENTELE_AVAILABLE = True
 except ImportError:
+    OpenTeleException = TFileNotFound = None  # type: ignore
     OPENTELE_AVAILABLE = False
 
 logging.basicConfig(
@@ -496,13 +498,65 @@ def make_isolated_tdata_copy(src: Path, account_dirname: str) -> Path:
     return dst
 
 
+def discover_keyfile_candidates(tdata_path: Path) -> List[str]:
+    """Возвращает возможные значения keyFile для TDesktop."""
+
+    candidates: List[str] = []
+    # Основные файлы вида key_*
+    for entry in sorted(tdata_path.glob("key_*")):
+        if entry.is_file():
+            suffix = entry.name[4:]
+            if suffix and suffix not in candidates:
+                candidates.append(suffix)
+
+    # Некоторые версии Telegram Desktop хранят ключи в key_datas/
+    nested_dir = tdata_path / "key_datas"
+    if nested_dir.is_dir():
+        for entry in sorted(nested_dir.glob("key_*")):
+            if entry.is_file():
+                suffix = entry.name[4:]
+                if suffix and suffix not in candidates:
+                    candidates.append(suffix)
+
+    return candidates
+
+
+def load_tdesktop_with_fallbacks(tdata_path: Path) -> TDesktop:
+    """Пытается загрузить tdata, перебирая доступные варианты keyFile."""
+
+    last_error: Optional[Exception] = None
+    tried: List[Optional[str]] = []
+
+    keyfile_candidates = [None] + discover_keyfile_candidates(tdata_path)
+    for keyfile in keyfile_candidates:
+        if keyfile in tried:
+            continue
+        tried.append(keyfile)
+        try:
+            kwargs = {"basePath": str(tdata_path)}
+            if keyfile:
+                kwargs["keyFile"] = keyfile
+            tdesk = TDesktop(**kwargs)  # type: ignore[arg-type]
+            if tdesk.isLoaded():
+                return tdesk
+            last_error = RuntimeError("TDesktop не загрузил данные tdata")
+        except Exception as exc:  # pragma: no cover - защитный блок
+            if OPENTELE_AVAILABLE and isinstance(exc, TFileNotFound):
+                last_error = exc
+                continue
+            last_error = exc
+            break
+
+    if last_error is None:
+        raise RuntimeError("Не удалось загрузить tdata: не найдены ключи шифрования")
+    raise RuntimeError(f"Не удалось загрузить tdata: {last_error}") from last_error
+
+
 async def convert_account_async(tdata_copy: Path, out_session: Path) -> None:
     if not OPENTELE_AVAILABLE:
         raise RuntimeError("Требуется библиотека opentele для конвертации tdata")
 
-    tdesk = TDesktop(tdata_copy)
-    if not tdesk.isLoaded():
-        raise RuntimeError("Не удалось загрузить tdata: аккаунт повреждён")
+    tdesk = load_tdesktop_with_fallbacks(tdata_copy)
 
     client = await tdesk.ToTelethon(session=str(out_session), flag=UseCurrentSession)
     try:
