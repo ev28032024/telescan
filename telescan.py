@@ -1260,6 +1260,16 @@ def build_parser(
         help="Папка для сохранения конвертированных из tdata сессий",
     )
     check_parser.add_argument(
+        "--tdata-root",
+        default=_config_str("check", check_cfg, "tdata_root", None),
+        help="Каталог с множеством поддиректорий tdata",
+    )
+    check_parser.add_argument(
+        "--session-dir",
+        default=_config_str("check", check_cfg, "session_dir", None),
+        help="Каталог, где лежат .session файлы",
+    )
+    check_parser.add_argument(
         "--convert-timeout",
         type=int,
         default=_config_int("check", check_cfg, "convert_timeout", 60),
@@ -1328,11 +1338,31 @@ def build_parser(
 async def handle_check(args: argparse.Namespace) -> int:
     args.concurrency = max(1, min(50, args.concurrency))
     sources: List[SourceItem] = []
-    for raw in args.inputs:
+    all_inputs = list(args.inputs)
+    if args.session_dir:
+        all_inputs.append(args.session_dir)
+
+    for raw in all_inputs:
         try:
             sources.append(detect_source(Path(raw)))
         except Exception as exc:
             logging.error("Не удалось обработать источник %s: %s", raw, exc)
+
+    if args.tdata_root:
+        tdata_root = Path(args.tdata_root)
+        if not tdata_root.is_dir():
+            logging.error("Каталог с tdata не найден: %s", tdata_root)
+        else:
+            added = 0
+            for entry in sorted(tdata_root.iterdir()):
+                if entry.is_dir() and looks_like_tdata(entry):
+                    sources.append(SourceItem(entry, SourceType.TDATA_DIRECTORY, entry.name))
+                    added += 1
+            if added == 0:
+                logging.warning(
+                    "В каталоге %s не найдено поддиректорий, похожих на tdata",
+                    tdata_root,
+                )
 
     if not sources:
         logging.error("Не найдено корректных источников для проверки")
