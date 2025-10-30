@@ -517,6 +517,9 @@ def discover_keyfile_candidates(tdata_path: Path) -> List[str]:
                 suffix = entry.name[4:]
                 if suffix and suffix not in candidates:
                     candidates.append(suffix)
+                nested_key = f"datas/{entry.name}"
+                if nested_key not in candidates:
+                    candidates.append(nested_key)
 
     return candidates
 
