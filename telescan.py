@@ -1175,6 +1175,31 @@ def generate_reports(
         logging.error("Ошибка записи отчёта: %s", exc)
 
 
+def write_convert_report(
+    conversions: Sequence[ConversionResult], output_dir: Path
+) -> Optional[Path]:
+    if not conversions:
+        return None
+
+    report_path = output_dir / "convert_report.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with report_path.open("w", encoding="utf-8") as handle:
+            json.dump(
+                [asdict(item) for item in conversions],
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+    except IOError as exc:
+        logging.error("Ошибка записи отчёта о конвертации: %s", exc)
+        return None
+
+    logging.info("Отчёт по конвертации сохранён: %s", report_path)
+    return report_path
+
+
 # ---------------------------------------------------------------------------
 # Checker runner
 # ---------------------------------------------------------------------------
@@ -1497,6 +1522,7 @@ async def handle_check(args: argparse.Namespace) -> int:
         return 1
 
     tasks, conversions = await prepare_tasks(args, sources)
+    write_convert_report(conversions, Path(args.convert_out))
     if not tasks:
         logging.error("Нет сессий для проверки")
         return 1
@@ -1506,13 +1532,6 @@ async def handle_check(args: argparse.Namespace) -> int:
 
     results = await run_checker(args, tasks)
     generate_reports(results, tasks, Path(args.out))
-
-    if conversions:
-        report_path = Path(args.convert_out) / "convert_report.json"
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        with report_path.open("w", encoding="utf-8") as handle:
-            json.dump([asdict(item) for item in conversions], handle, ensure_ascii=False, indent=2)
-        logging.info("Отчёт по конвертации сохранён: %s", report_path)
     return 0
 
 
@@ -1586,12 +1605,11 @@ async def handle_convert(args: argparse.Namespace) -> int:
             if cleanup_dir:
                 shutil.rmtree(cleanup_dir, ignore_errors=True)
 
-    summary_path = output_dir / "convert_report.json"
-    with summary_path.open("w", encoding="utf-8") as handle:
-        json.dump([asdict(item) for item in results], handle, ensure_ascii=False, indent=2)
+    summary_path = write_convert_report(results, output_dir)
     ok_count = sum(1 for item in results if item.status == "ok")
     logging.info("Готово: %d/%d успешно", ok_count, len(results))
-    logging.info("Отчёт: %s", summary_path)
+    if summary_path:
+        logging.info("Отчёт: %s", summary_path)
     return 0 if ok_count == len(results) else 2
 
 
