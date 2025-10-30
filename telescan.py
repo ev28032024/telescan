@@ -1,0 +1,1113 @@
+#!/usr/bin/env python3
+"""telescan.py
+================
+
+Утилита для работы с Telegram аккаунтами через Telethon и opentele.
+
+Функциональность:
+* Конвертация папок tdata в Telethon `.session` файлы.
+* Конвертация `.session` файлов обратно в tdata.
+* Асинхронная проверка валидности сессий (включая StringSession).
+* Живой прогресс с расчётом ETA/CPM, подробная отчётность в CSV и JSON.
+* Поддержка ротации API ключей и прокси (round/random/sticky стратегии).
+* Гибкие лимиты параллелизма, backoff, таймауты и rate limiting.
+
+Важно: используйте программу исключительно для аккаунтов, на которые у вас есть права.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import csv
+import json
+import logging
+import os
+import random
+import shutil
+import sys
+import tempfile
+import time
+from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any, AsyncGenerator, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
+
+try:
+    from telethon import TelegramClient
+    from telethon.errors import FloodWaitError, RPCError, SessionPasswordNeededError
+    from telethon.sessions import StringSession
+except ImportError as exc:  # pragma: no cover - критическая ошибка конфигурации окружения
+    raise SystemExit(
+        "[ERROR] Требуется установить telethon: pip install telethon"
+    ) from exc
+
+try:  # pragma: no cover - опциональная зависимость
+    from tqdm.asyncio import tqdm
+except ImportError as exc:
+    raise SystemExit("[ERROR] Требуется установить tqdm: pip install tqdm") from exc
+
+try:  # pragma: no cover - опциональная зависимость
+    from opentele.api import UseCurrentSession
+    from opentele.td import TDesktop
+
+    OPENTELE_AVAILABLE = True
+except ImportError:
+    OPENTELE_AVAILABLE = False
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s - %(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+
+try:  # pragma: no cover - опциональная зависимость
+    import socks
+except ImportError:  # pragma: no cover
+    socks = None
+    logging.warning(
+        "[WARNING] PySocks не установлен. Поддержка прокси будет недоступна."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Data classes & enums
+# ---------------------------------------------------------------------------
+
+
+class SourceType(Enum):
+    """Возможные типы входных источников."""
+
+    TELETHON_SESSION_FILE = "session_file"
+    TELETHON_SESSION_DIR = "session_dir"
+    STRING_SESSION_CSV = "string_csv"
+    TDATA_DIRECTORY = "tdata"
+
+
+@dataclass
+class SourceItem:
+    """Описание одного входного источника."""
+
+    path: Path
+    type: SourceType
+    label: str
+
+
+@dataclass
+class ApiPair:
+    api_id: int
+    api_hash: str
+    label: str
+
+
+@dataclass
+class ProxySpec:
+    raw: str
+    scheme: str
+    host: str
+    port: int
+    username: Optional[str] = None
+    password: Optional[str] = None
+
+
+@dataclass
+class CheckResult:
+    key: str
+    ok: bool
+    error: Optional[str]
+    user_id: Optional[int]
+    username: Optional[str]
+    first_name: Optional[str]
+    phone: Optional[str]
+    checked_at: str
+    api_label: Optional[str]
+    proxy: Optional[str]
+    latency_ms: Optional[int]
+    attempts: int
+    duration_s: float
+
+
+@dataclass
+class ConversionResult:
+    source: str
+    status: str
+    output: Optional[str]
+    duration_s: float
+    error: Optional[str] = None
+    api_label: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Helpers: API, proxies, filesystem
+# ---------------------------------------------------------------------------
+
+
+def load_api_pairs(path: str) -> List[ApiPair]:
+    """Загружает пары API ID/Hash из JSON файла."""
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Не удалось прочитать файл с API ключами: {exc}") from exc
+
+    if not isinstance(data, Sequence):
+        raise ValueError("JSON должен содержать массив объектов API ключей")
+
+    result: List[ApiPair] = []
+    for idx, item in enumerate(data):
+        try:
+            api_id = int(item["api_id"])
+            api_hash = str(item["api_hash"])
+            label = str(item.get("label", f"api_{idx}"))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Неверный формат API ключа #{idx}: {item}") from exc
+        result.append(ApiPair(api_id, api_hash, label))
+
+    if not result:
+        raise ValueError("Список API ключей пуст")
+
+    return result
+
+
+def parse_proxy_line(line: str) -> ProxySpec:
+    """Парсит строку с описанием прокси."""
+
+    line = line.strip()
+    if not line:
+        raise ValueError("Пустая строка прокси")
+
+    if "://" not in line:
+        # По умолчанию считаем, что это socks5
+        line = f"socks5://{line}"
+
+    parsed = urlparse(line)
+    if not parsed.hostname or not parsed.port:
+        raise ValueError(f"Не удалось разобрать строку прокси: {line}")
+
+    return ProxySpec(
+        raw=line,
+        scheme=(parsed.scheme or "socks5").lower(),
+        host=parsed.hostname,
+        port=parsed.port,
+        username=parsed.username,
+        password=parsed.password,
+    )
+
+
+def load_proxies(path: str) -> List[ProxySpec]:
+    proxies: List[ProxySpec] = []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                raw = raw.strip()
+                if not raw or raw.startswith("#"):
+                    continue
+                try:
+                    proxies.append(parse_proxy_line(raw))
+                except ValueError as exc:
+                    logging.warning("Пропущен некорректный прокси '%s': %s", raw, exc)
+    except FileNotFoundError:
+        logging.error("Файл с прокси не найден: %s", path)
+    return proxies
+
+
+def get_telethon_proxy(proxy: ProxySpec) -> tuple:
+    if not socks:
+        raise RuntimeError("PySocks не установлен, использование прокси невозможно")
+
+    proxy_map = {
+        "socks5": socks.SOCKS5,
+        "socks5h": socks.SOCKS5,
+        "socks4": socks.SOCKS4,
+        "http": socks.HTTP,
+        "https": socks.HTTP,
+    }
+    proxy_type = proxy_map.get(proxy.scheme, socks.SOCKS5)
+    return (proxy_type, proxy.host, proxy.port, True, proxy.username, proxy.password)
+
+
+# ---------------------------------------------------------------------------
+# Source detection
+# ---------------------------------------------------------------------------
+
+
+def looks_like_tdata(path: Path) -> bool:
+    """Эвристическое определение директории tdata."""
+
+    if not path.is_dir():
+        return False
+
+    indicator_files = ["map0", "map1", "map2", "user_data", "key_datas"]
+    if any((path / name).exists() for name in indicator_files):
+        return True
+
+    hashed_dirs = [p for p in path.iterdir() if p.is_dir() and len(p.name) >= 16]
+    return len(hashed_dirs) > 0
+
+
+def detect_source(path: Path) -> SourceItem:
+    """Определяет тип входного источника."""
+
+    if not path.exists():
+        raise FileNotFoundError(f"Источник '{path}' не найден")
+
+    if path.is_file():
+        suffix = path.suffix.lower()
+        if suffix == ".session":
+            return SourceItem(path, SourceType.TELETHON_SESSION_FILE, path.stem)
+        if suffix in {".csv", ".txt"}:
+            # CSV со строковыми сессиями
+            return SourceItem(path, SourceType.STRING_SESSION_CSV, path.stem)
+        raise ValueError(f"Неизвестный формат файла: {path}")
+
+    # директория
+    if looks_like_tdata(path):
+        return SourceItem(path, SourceType.TDATA_DIRECTORY, path.name)
+
+    session_files = list(path.glob("*.session"))
+    if session_files:
+        return SourceItem(path, SourceType.TELETHON_SESSION_DIR, path.name)
+
+    csv_files = list(path.glob("*.csv"))
+    if csv_files:
+        return SourceItem(path, SourceType.STRING_SESSION_CSV, path.name)
+
+    raise ValueError(f"Не удалось определить формат источника: {path}")
+
+
+# ---------------------------------------------------------------------------
+# tdata -> Telethon session
+# ---------------------------------------------------------------------------
+
+
+def detect_account_dirs(tdata_path: Path) -> List[str]:
+    shared = {
+        "countries",
+        "emoji",
+        "prefix",
+        "key_datas",
+        "settingss",
+        "user_data",
+        "usertag",
+        "shortcuts-default.json",
+        "shortcuts-custom.json",
+        "dumps",
+        "temp",
+        "map",
+        "logs",
+    }
+
+    candidates: List[str] = []
+    for entry in sorted(tdata_path.iterdir()):
+        if entry.is_dir() and entry.name not in shared and len(entry.name) >= 16:
+            candidates.append(entry.name)
+
+    if not candidates:
+        for entry in sorted(tdata_path.iterdir()):
+            if entry.is_dir() and entry.name not in shared:
+                candidates.append(entry.name)
+    return candidates
+
+
+def make_isolated_tdata_copy(src: Path, account_dirname: str) -> Path:
+    tmp_root = Path(tempfile.mkdtemp(prefix=f"tdata_iso_{account_dirname}_"))
+    dst = tmp_root / "tdata"
+    dst.mkdir()
+
+    shutil.copytree(src / account_dirname, dst / account_dirname)
+    for entry in src.iterdir():
+        if entry.name == account_dirname:
+            continue
+        try:
+            if entry.is_dir():
+                if entry.name not in {"dumps", "temp", "log", "logs"}:
+                    shutil.copytree(entry, dst / entry.name, dirs_exist_ok=True)
+            else:
+                shutil.copy2(entry, dst / entry.name)
+        except (OSError, shutil.Error) as exc:
+            logging.warning("Не удалось скопировать '%s': %s", entry.name, exc)
+    return dst
+
+
+async def convert_account_async(tdata_copy: Path, out_session: Path) -> None:
+    if not OPENTELE_AVAILABLE:
+        raise RuntimeError("Требуется библиотека opentele для конвертации tdata")
+
+    tdesk = TDesktop(tdata_copy)
+    if not tdesk.isLoaded():
+        raise RuntimeError("Не удалось загрузить tdata: аккаунт повреждён")
+
+    client = await tdesk.ToTelethon(session=str(out_session), flag=UseCurrentSession)
+    try:
+        await client.connect()
+    finally:
+        if client.is_connected():
+            await client.disconnect()
+
+
+async def _convert_tdata_worker(
+    account: str,
+    src_tdata: Path,
+    output_dir: Path,
+    timeout: int,
+    keep_temp: bool,
+    semaphore: asyncio.Semaphore,
+) -> ConversionResult:
+    async with semaphore:
+        started = time.monotonic()
+        tmp_copy: Optional[Path] = None
+        session_path = output_dir / f"{account}.session"
+        try:
+            tmp_copy = await asyncio.to_thread(make_isolated_tdata_copy, src_tdata, account)
+            await asyncio.wait_for(
+                convert_account_async(tmp_copy, session_path), timeout=timeout
+            )
+            status = "ok"
+            error = None
+        except asyncio.TimeoutError:
+            status = "timeout"
+            error = f"Конвертация превысила таймаут {timeout} сек"
+        except Exception as exc:
+            status = "error"
+            error = str(exc)
+            logging.error("Ошибка конвертации tdata (%s): %s", account, exc)
+        finally:
+            duration = time.monotonic() - started
+            if tmp_copy and not keep_temp:
+                try:
+                    await asyncio.to_thread(shutil.rmtree, tmp_copy.parent)
+                except Exception as exc:  # pragma: no cover - best effort cleanup
+                    logging.warning("Не удалось удалить временную директорию %s: %s", tmp_copy.parent, exc)
+
+        return ConversionResult(
+            source=account,
+            status=status,
+            output=str(session_path) if status == "ok" else None,
+            duration_s=duration,
+            error=error,
+        )
+
+
+async def convert_tdata_directory(
+    src_tdata: Path,
+    output_dir: Path,
+    timeout: int,
+    keep_temp: bool,
+    parallel: int,
+) -> List[ConversionResult]:
+    if not src_tdata.is_dir():
+        raise FileNotFoundError(f"Директория tdata не найдена: {src_tdata}")
+
+    accounts = detect_account_dirs(src_tdata)
+    if not accounts:
+        logging.warning("В папке %s не найдено аккаунтов", src_tdata)
+        return []
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    semaphore = asyncio.Semaphore(max(1, parallel))
+    tasks = [
+        _convert_tdata_worker(account, src_tdata, output_dir, timeout, keep_temp, semaphore)
+        for account in accounts
+    ]
+
+    results: List[ConversionResult] = []
+    start_ts = time.monotonic()
+    with tqdm(total=len(tasks), desc="Конвертация tdata", unit="акк") as progress:
+        for future in asyncio.as_completed(tasks):
+            res = await future
+            results.append(res)
+            progress.update(1)
+            elapsed = time.monotonic() - start_ts
+            cpm = (len(results) / elapsed * 60) if elapsed > 0 else 0.0
+            progress.set_postfix(cpm=f"{cpm:.1f}")
+            if res.status != "ok" and res.error:
+                progress.set_postfix_str(f"Ошибка {res.source}: {res.error[:40]}")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Telethon session -> tdata
+# ---------------------------------------------------------------------------
+
+
+async def convert_session_to_tdata(
+    session_file: Path,
+    out_dir: Path,
+    api_pair: ApiPair,
+    timeout: int,
+) -> ConversionResult:
+    if not OPENTELE_AVAILABLE:
+        raise RuntimeError("opentele обязателен для экспорта в tdata")
+
+    started = time.monotonic()
+    out_account_dir = out_dir / session_file.stem
+    out_account_dir.mkdir(parents=True, exist_ok=True)
+
+    client = TelegramClient(str(session_file), api_pair.api_id, api_pair.api_hash)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=timeout)
+        if not await client.is_user_authorized():
+            raise RuntimeError("Сессия не авторизована")
+
+        me = await client.get_me()
+        logging.debug(
+            "Экспортируем %s (user_id=%s)", session_file.name, getattr(me, "id", None)
+        )
+
+        desktop = await asyncio.wait_for(
+            client.ToTDesktop(flag=UseCurrentSession), timeout=timeout
+        )
+        await asyncio.to_thread(desktop.SaveTData, str(out_account_dir))
+        status = "ok"
+        error = None
+    except Exception as exc:
+        status = "error"
+        error = str(exc)
+        logging.error("Не удалось конвертировать %s: %s", session_file.name, exc)
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:  # pragma: no cover - best effort cleanup
+            pass
+
+    return ConversionResult(
+        source=str(session_file),
+        status=status,
+        output=str(out_account_dir) if status == "ok" else None,
+        duration_s=time.monotonic() - started,
+        error=error,
+        api_label=api_pair.label,
+    )
+
+
+async def convert_sessions_directory(
+    sessions_dir: Path,
+    out_dir: Path,
+    api_pairs: Sequence[ApiPair],
+    concurrency: int,
+    timeout: int,
+) -> List[ConversionResult]:
+    session_files = sorted(p for p in sessions_dir.glob("*.session") if p.is_file())
+    if not session_files:
+        logging.warning("В директории %s не найдено файлов .session", sessions_dir)
+        return []
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+    api_rotator = ApiRotator(list(api_pairs))
+
+    async def worker(index: int, path: Path) -> ConversionResult:
+        async with semaphore:
+            api = api_rotator.pick(index)
+            return await convert_session_to_tdata(path, out_dir, api, timeout)
+
+    tasks = [worker(idx, path) for idx, path in enumerate(session_files)]
+    results: List[ConversionResult] = []
+    start_ts = time.monotonic()
+
+    with tqdm(total=len(tasks), desc="Сессии → tdata", unit="файл") as progress:
+        for fut in asyncio.as_completed(tasks):
+            res = await fut
+            results.append(res)
+            progress.update(1)
+            elapsed = time.monotonic() - start_ts
+            cpm = (len(results) / elapsed * 60) if elapsed > 0 else 0.0
+            progress.set_postfix(cpm=f"{cpm:.1f}")
+            if res.status != "ok" and res.error:
+                progress.set_postfix_str(f"Ошибка: {res.error[:40]}")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Session checking core
+# ---------------------------------------------------------------------------
+
+
+class ApiRotator:
+    def __init__(self, apis: Sequence[ApiPair]):
+        apis = list(apis)
+        if not apis:
+            raise ValueError("Список API ключей пуст")
+        self._apis = apis
+        self._count = len(apis)
+
+    def pick(self, index: int) -> ApiPair:
+        return self._apis[index % self._count]
+
+
+class ProxyRotator:
+    def __init__(self, proxies: Sequence[ProxySpec], strategy: str):
+        self._proxies = list(proxies)
+        self._strategy = strategy
+        self._sticky: Dict[str, ProxySpec] = {}
+        self._counter = 0
+
+    def choose(self, key: str) -> Optional[ProxySpec]:
+        if not self._proxies:
+            return None
+        if self._strategy == "random":
+            return random.choice(self._proxies)
+        if self._strategy == "sticky":
+            if key not in self._sticky:
+                self._sticky[key] = random.choice(self._proxies)
+            return self._sticky[key]
+        # round robin
+        proxy = self._proxies[self._counter % len(self._proxies)]
+        self._counter += 1
+        return proxy
+
+
+@asynccontextmanager
+async def telegram_client_manager(
+    session: str | StringSession,
+    api_id: int,
+    api_hash: str,
+    proxy: Optional[tuple],
+    timeout: int,
+) -> AsyncGenerator[TelegramClient, None]:
+    client = TelegramClient(session, api_id, api_hash, proxy=proxy, timeout=timeout)
+    try:
+        await client.connect()
+        yield client
+    finally:
+        if client.is_connected():
+            await client.disconnect()
+
+
+async def check_session_async(
+    key: str,
+    session_value: Optional[str],
+    session_file: Optional[Path],
+    api_pair: ApiPair,
+    proxy_spec: Optional[ProxySpec],
+    rate_delay: float,
+    connect_timeout: int,
+    max_attempts: int,
+    backoff_base: float,
+) -> CheckResult:
+    start_time = time.monotonic()
+    last_error: Optional[str] = "no_session"
+
+    session_arg: Optional[str | StringSession]
+    if session_value:
+        session_arg = StringSession(session_value)
+    elif session_file:
+        session_arg = str(session_file)
+    else:
+        session_arg = None
+
+    if not session_arg:
+        return CheckResult(
+            key,
+            False,
+            last_error,
+            None,
+            None,
+            None,
+            None,
+            datetime.utcnow().isoformat(),
+            api_pair.label,
+            proxy_spec.raw if proxy_spec else None,
+            None,
+            0,
+            0.0,
+        )
+
+    proxy_tuple = None
+    if proxy_spec:
+        try:
+            proxy_tuple = get_telethon_proxy(proxy_spec)
+        except RuntimeError as exc:
+            return CheckResult(
+                key,
+                False,
+                f"proxy_error:{exc}",
+                None,
+                None,
+                None,
+                None,
+                datetime.utcnow().isoformat(),
+                api_pair.label,
+                proxy_spec.raw,
+                None,
+                0,
+                0.0,
+            )
+
+    for attempt in range(1, max_attempts + 1):
+        started_attempt = time.monotonic()
+        try:
+            async with telegram_client_manager(
+                session_arg, api_pair.api_id, api_pair.api_hash, proxy_tuple, connect_timeout
+            ) as client:
+                if rate_delay > 0:
+                    await asyncio.sleep(rate_delay)
+
+                if not await client.is_user_authorized():
+                    latency = int((time.monotonic() - started_attempt) * 1000)
+                    return CheckResult(
+                        key,
+                        False,
+                        "unauthorized",
+                        None,
+                        None,
+                        None,
+                        None,
+                        datetime.utcnow().isoformat(),
+                        api_pair.label,
+                        proxy_spec.raw if proxy_spec else None,
+                        latency,
+                        attempt,
+                        time.monotonic() - start_time,
+                    )
+
+                me = await client.get_me()
+                latency = int((time.monotonic() - started_attempt) * 1000)
+                first_name = getattr(me, "first_name", None)
+                last_name = getattr(me, "last_name", None)
+                if first_name and last_name:
+                    display_name = f"{first_name} {last_name}".strip()
+                else:
+                    display_name = first_name or last_name
+
+                return CheckResult(
+                    key,
+                    True,
+                    None,
+                    getattr(me, "id", None),
+                    getattr(me, "username", None),
+                    display_name,
+                    getattr(me, "phone", None),
+                    datetime.utcnow().isoformat(),
+                    api_pair.label,
+                    proxy_spec.raw if proxy_spec else None,
+                    latency,
+                    attempt,
+                    time.monotonic() - start_time,
+                )
+        except FloodWaitError as exc:
+            last_error = f"FloodWait:{exc.seconds}s"
+            wait_time = min(300, backoff_base**attempt + exc.seconds)
+            logging.warning("FloodWait для %s. Пауза %.1f сек", key, wait_time)
+            await asyncio.sleep(wait_time)
+        except SessionPasswordNeededError:
+            last_error = "2FA_enabled"
+            break
+        except RPCError as exc:
+            last_error = f"RPCError:{type(exc).__name__}"
+            await asyncio.sleep(min(60, backoff_base**attempt))
+        except (asyncio.TimeoutError, OSError):
+            last_error = "timeout"
+            await asyncio.sleep(min(60, backoff_base**attempt))
+        except Exception as exc:  # pragma: no cover - неизвестные ошибки
+            last_error = f"UnknownError:{type(exc).__name__}"
+            logging.error("Неизвестная ошибка при проверке %s: %s", key, exc)
+            await asyncio.sleep(min(30, backoff_base**attempt))
+
+    return CheckResult(
+        key,
+        False,
+        last_error,
+        None,
+        None,
+        None,
+        None,
+        datetime.utcnow().isoformat(),
+        api_pair.label,
+        proxy_spec.raw if proxy_spec else None,
+        None,
+        max_attempts,
+        time.monotonic() - start_time,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reporting & task preparation
+# ---------------------------------------------------------------------------
+
+
+def list_session_files(folder: Path) -> List[Path]:
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Директория {folder} не найдена")
+    return sorted(p for p in folder.glob("*.session") if p.is_file())
+
+
+def load_string_sessions_csv(path: Path) -> List[Tuple[str, str]]:
+    if not path.is_file():
+        raise FileNotFoundError(f"CSV файл не найден: {path}")
+
+    sessions: List[Tuple[str, str]] = []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.reader(handle)
+        for idx, row in enumerate(reader, start=1):
+            if not row:
+                continue
+            if len(row) == 1:
+                key, session_str = f"row_{idx}", row[0].strip()
+            else:
+                key, session_str = row[0].strip(), row[1].strip()
+            if key and session_str:
+                sessions.append((key, session_str))
+            else:
+                logging.warning("Пропущена пустая строка CSV #%d", idx)
+    return sessions
+
+
+async def prepare_tasks(
+    args: argparse.Namespace,
+    sources: Sequence[SourceItem],
+) -> Tuple[List[Tuple[str, Optional[str], Optional[Path]]], List[ConversionResult]]:
+    tasks: List[Tuple[str, Optional[str], Optional[Path]]] = []
+    conversions: List[ConversionResult] = []
+
+    for item in sources:
+        logging.info("Источник '%s' определён как %s", item.path, item.type.value)
+        if item.type == SourceType.TELETHON_SESSION_FILE:
+            tasks.append((item.label, None, item.path))
+        elif item.type == SourceType.TELETHON_SESSION_DIR:
+            for file_path in list_session_files(item.path):
+                tasks.append((file_path.stem, None, file_path))
+        elif item.type == SourceType.STRING_SESSION_CSV:
+            for key, session_str in load_string_sessions_csv(item.path):
+                tasks.append((key, session_str, None))
+        elif item.type == SourceType.TDATA_DIRECTORY:
+            conversion_results = await convert_tdata_directory(
+                item.path,
+                Path(args.convert_out),
+                args.convert_timeout,
+                args.keep_temp,
+                max(1, min(args.convert_parallel, 8)),
+            )
+            conversions.extend(conversion_results)
+            for res in conversion_results:
+                if res.status == "ok" and res.output:
+                    tasks.append((f"tdata_{item.label}_{res.source}", None, Path(res.output)))
+        else:  # pragma: no cover - безопасность от будущих расширений
+            raise RuntimeError(f"Необработанный тип источника: {item.type}")
+
+    unique: Dict[str, Tuple[str, Optional[str], Optional[Path]]] = {}
+    for task in tasks:
+        if task[0] not in unique:
+            unique[task[0]] = task
+    if len(unique) != len(tasks):
+        logging.info("Удалено %d дубликатов", len(tasks) - len(unique))
+
+    return list(unique.values()), conversions
+
+
+def generate_reports(
+    results: Sequence[CheckResult],
+    tasks: Sequence[Tuple[str, Optional[str], Optional[Path]]],
+    out_path: Path,
+) -> None:
+    fieldnames = list(CheckResult.__annotations__.keys())
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    valid_path = out_path.with_name("valid.csv")
+    invalid_path = out_path.with_name("invalid.csv")
+
+    valid_dir = out_path.with_name("valid_sessions")
+    invalid_dir = out_path.with_name("invalid_sessions")
+    valid_dir.mkdir(parents=True, exist_ok=True)
+    invalid_dir.mkdir(parents=True, exist_ok=True)
+
+    results_map = {item.key: item for item in results}
+
+    try:
+        with out_path.open("w", newline="", encoding="utf-8") as main_file, \
+            valid_path.open("w", newline="", encoding="utf-8") as valid_file, \
+            invalid_path.open("w", newline="", encoding="utf-8") as invalid_file:
+
+            main_writer = csv.DictWriter(main_file, fieldnames=fieldnames)
+            valid_writer = csv.DictWriter(valid_file, fieldnames=fieldnames)
+            invalid_writer = csv.DictWriter(invalid_file, fieldnames=fieldnames)
+            main_writer.writeheader()
+            valid_writer.writeheader()
+            invalid_writer.writeheader()
+
+            for result in results:
+                row = asdict(result)
+                main_writer.writerow(row)
+                if result.ok:
+                    valid_writer.writerow(row)
+                else:
+                    invalid_writer.writerow(row)
+
+        for key, _, session_path in tasks:
+            if session_path and session_path.exists():
+                result = results_map.get(key)
+                if not result:
+                    continue
+                target_dir = valid_dir if result.ok else invalid_dir
+                try:
+                    shutil.copy2(session_path, target_dir / session_path.name)
+                except (OSError, IOError) as exc:
+                    logging.warning("Не удалось скопировать %s: %s", session_path, exc)
+
+        logging.info(
+            "Отчёты сохранены: %s, %s, %s", out_path.name, valid_path.name, invalid_path.name
+        )
+    except IOError as exc:
+        logging.error("Ошибка записи отчёта: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Checker runner
+# ---------------------------------------------------------------------------
+
+
+async def run_checker(
+    args: argparse.Namespace,
+    tasks: Sequence[Tuple[str, Optional[str], Optional[Path]]],
+) -> List[CheckResult]:
+    total = len(tasks)
+    apis = load_api_pairs(args.apis)
+    proxies = load_proxies(args.proxies) if args.proxies else []
+
+    api_rotator = ApiRotator(apis)
+    proxy_rotator = ProxyRotator(proxies, args.proxy_strategy)
+    semaphore = asyncio.Semaphore(args.concurrency)
+
+    async def worker(idx: int, task: Tuple[str, Optional[str], Optional[Path]]) -> CheckResult:
+        key, session_str, session_file = task
+        async with semaphore:
+            api = api_rotator.pick(idx)
+            proxy = proxy_rotator.choose(key)
+
+            if args.dry_run:
+                await asyncio.sleep(0.01)
+                return CheckResult(
+                    key,
+                    False,
+                    "dry_run",
+                    None,
+                    None,
+                    None,
+                    None,
+                    datetime.utcnow().isoformat(),
+                    api.label,
+                    proxy.raw if proxy else None,
+                    None,
+                    0,
+                    0.0,
+                )
+
+            return await check_session_async(
+                key,
+                session_str,
+                session_file,
+                api,
+                proxy,
+                args.rate_delay,
+                args.connect_timeout,
+                args.max_attempts,
+                args.backoff_base,
+            )
+
+    coroutines = [worker(idx, task) for idx, task in enumerate(tasks)]
+    results: List[CheckResult] = []
+    start_ts = time.monotonic()
+
+    progress = tqdm(total=total, desc="Проверка сессий", unit="акк")
+    try:
+        for future in asyncio.as_completed(coroutines):
+            result = await future
+            results.append(result)
+            progress.update(1)
+            elapsed = time.monotonic() - start_ts
+            cpm = (len(results) / elapsed * 60) if elapsed > 0 else 0.0
+            progress.set_postfix(cpm=f"{cpm:.1f}")
+    finally:
+        progress.close()
+
+    ok_count = sum(1 for item in results if item.ok)
+    logging.info("Проверка завершена. Валидных: %d / %d", ok_count, len(results))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="telescan",
+        description="Универсальный инструмент работы с Telegram сессиями",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # --- CHECK ---
+    check_parser = subparsers.add_parser(
+        "check",
+        help="Проверка валидности сессий",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    check_parser.add_argument(
+        "inputs",
+        nargs="+",
+        help="Пути к источникам (.session, директориям, CSV, tdata)",
+    )
+    check_parser.add_argument("--apis", required=True, help="JSON файл с API ключами")
+    check_parser.add_argument("--proxies", help="Файл со списком прокси")
+    check_parser.add_argument(
+        "--proxy-strategy",
+        choices=["round", "random", "sticky"],
+        default="round",
+        help="Стратегия выбора прокси",
+    )
+    check_parser.add_argument(
+        "-c",
+        "--concurrency",
+        type=int,
+        default=20,
+        help="Количество одновременных проверок (1-50)",
+    )
+    check_parser.add_argument("--max-attempts", type=int, default=3, help="Повторы при ошибках")
+    check_parser.add_argument("--connect-timeout", type=int, default=20, help="Таймаут подключения")
+    check_parser.add_argument("--backoff-base", type=float, default=1.7, help="Основание backoff")
+    check_parser.add_argument("--rate-delay", type=float, default=0.3, help="Задержка перед запросами")
+    check_parser.add_argument("--out", default="./reports/report.csv", help="Путь к CSV отчёту")
+    check_parser.add_argument("--dry-run", action="store_true", help="Без реальных запросов")
+
+    check_parser.add_argument(
+        "--convert-out",
+        default="./converted_sessions",
+        help="Папка для сохранения конвертированных из tdata сессий",
+    )
+    check_parser.add_argument("--convert-timeout", type=int, default=60, help="Таймаут конвертации tdata")
+    check_parser.add_argument("--convert-parallel", type=int, default=2, help="Параллелизм конвертации tdata")
+    check_parser.add_argument("--keep-temp", action="store_true", help="Не удалять временные копии tdata")
+
+    # --- CONVERT ---
+    convert_parser = subparsers.add_parser(
+        "convert",
+        help="Конвертация tdata <-> Telethon session",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    convert_parser.add_argument(
+        "mode",
+        choices=["tdata-to-session", "session-to-tdata"],
+        help="Направление конвертации",
+    )
+    convert_parser.add_argument("input", help="Путь к исходным данным")
+    convert_parser.add_argument("--output", required=True, help="Директория для результата")
+    convert_parser.add_argument("--timeout", type=int, default=60, help="Таймаут на единицу работы")
+    convert_parser.add_argument("--parallel", type=int, default=4, help="Параллелизм (1-8)")
+    convert_parser.add_argument("--keep-temp", action="store_true", help="Не удалять временные tdata (только tdata→session)")
+    convert_parser.add_argument("--apis", help="JSON с API ключами (нужно для session→tdata)")
+
+    return parser
+
+
+async def handle_check(args: argparse.Namespace) -> int:
+    args.concurrency = max(1, min(50, args.concurrency))
+    sources: List[SourceItem] = []
+    for raw in args.inputs:
+        try:
+            sources.append(detect_source(Path(raw)))
+        except Exception as exc:
+            logging.error("Не удалось обработать источник %s: %s", raw, exc)
+
+    if not sources:
+        logging.error("Не найдено корректных источников для проверки")
+        return 1
+
+    tasks, conversions = await prepare_tasks(args, sources)
+    if not tasks:
+        logging.error("Нет сессий для проверки")
+        return 1
+
+    if args.dry_run:
+        logging.info("Режим dry-run: сетевые запросы выполняться не будут")
+
+    results = await run_checker(args, tasks)
+    generate_reports(results, tasks, Path(args.out))
+
+    if conversions:
+        report_path = Path(args.convert_out) / "convert_report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        with report_path.open("w", encoding="utf-8") as handle:
+            json.dump([asdict(item) for item in conversions], handle, ensure_ascii=False, indent=2)
+        logging.info("Отчёт по конвертации сохранён: %s", report_path)
+    return 0
+
+
+async def handle_convert(args: argparse.Namespace) -> int:
+    mode = args.mode
+    input_path = Path(args.input)
+    output_dir = Path(args.output)
+
+    if mode == "tdata-to-session":
+        if not looks_like_tdata(input_path):
+            logging.error("%s не похож на директорию tdata", input_path)
+            return 1
+        results = await convert_tdata_directory(
+            input_path,
+            output_dir,
+            args.timeout,
+            args.keep_temp,
+            max(1, min(args.parallel, 8)),
+        )
+    else:
+        if not args.apis:
+            logging.error("Для конвертации session→tdata требуется указать --apis")
+            return 1
+        api_pairs = load_api_pairs(args.apis)
+        if input_path.is_file() and input_path.suffix == ".session":
+            session_dir = Path(tempfile.mkdtemp(prefix="session_single_"))
+            shutil.copy2(input_path, session_dir / input_path.name)
+            cleanup_dir = session_dir
+        else:
+            session_dir = input_path
+            cleanup_dir = None
+
+        try:
+            results = await convert_sessions_directory(
+                session_dir,
+                output_dir,
+                api_pairs,
+                max(1, min(args.parallel, 16)),
+                args.timeout,
+            )
+        finally:
+            if cleanup_dir:
+                shutil.rmtree(cleanup_dir, ignore_errors=True)
+
+    summary_path = output_dir / "convert_report.json"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump([asdict(item) for item in results], handle, ensure_ascii=False, indent=2)
+    ok_count = sum(1 for item in results if item.status == "ok")
+    logging.info("Готово: %d/%d успешно", ok_count, len(results))
+    logging.info("Отчёт: %s", summary_path)
+    return 0 if ok_count == len(results) else 2
+
+
+async def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command == "check":
+        return await handle_check(args)
+    if args.command == "convert":
+        return await handle_convert(args)
+    parser.error("Неизвестная команда")  # pragma: no cover
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(asyncio.run(main()))
+    except KeyboardInterrupt:
+        logging.info("Операция прервана пользователем")
+        sys.exit(130)
+    except Exception as exc:  # pragma: no cover - safety net
+        logging.critical("Необработанная ошибка: %s", exc, exc_info=True)
+        sys.exit(1)
