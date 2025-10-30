@@ -590,7 +590,39 @@ def make_isolated_tdata_copy(src: Path, account_dirname: str) -> Path:
     dst = tmp_root / "tdata"
     dst.mkdir()
 
-    shutil.copytree(src / account_dirname, dst / account_dirname)
+    account_src = src / account_dirname
+
+    def copy_into_dst(root: Path) -> None:
+        for entry in root.iterdir():
+            try:
+                if entry.is_dir():
+                    shutil.copytree(entry, dst / entry.name, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(entry, dst / entry.name)
+            except (OSError, shutil.Error) as exc:
+                logging.warning("Не удалось скопировать '%s': %s", entry.name, exc)
+
+    # Если сама директория аккаунта уже является корнем tdata (например, tdata лежит в подкаталоге),
+    # копируем её содержимое напрямую.
+    if account_src.is_dir() and looks_like_tdata(account_src):
+        copy_into_dst(account_src)
+        return dst
+
+    nested_tdata = account_src / "tdata"
+    if nested_tdata.is_dir() and looks_like_tdata(nested_tdata):
+        copy_into_dst(nested_tdata)
+        for extra in account_src.iterdir():
+            if extra == nested_tdata:
+                continue
+            try:
+                if extra.is_dir():
+                    continue
+                shutil.copy2(extra, dst / extra.name)
+            except (OSError, shutil.Error) as exc:
+                logging.warning("Не удалось скопировать '%s': %s", extra.name, exc)
+        return dst
+
+    shutil.copytree(account_src, dst / account_dirname)
     for entry in src.iterdir():
         if entry.name == account_dirname:
             continue
