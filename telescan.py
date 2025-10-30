@@ -438,13 +438,13 @@ def detect_source(path: Path) -> SourceItem:
             return SourceItem(path, SourceType.STRING_SESSION_CSV, path.stem)
         raise ValueError(f"Неизвестный формат файла: {path}")
 
-    # директория
-    if looks_like_tdata(path):
-        return SourceItem(path, SourceType.TDATA_DIRECTORY, path.name)
-
     session_files = list(path.glob("*.session"))
     if session_files:
         return SourceItem(path, SourceType.TELETHON_SESSION_DIR, path.name)
+
+    # директория
+    if looks_like_tdata(path):
+        return SourceItem(path, SourceType.TDATA_DIRECTORY, path.name)
 
     csv_files = list(path.glob("*.csv"))
     if csv_files:
