@@ -20,7 +20,7 @@
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install telethon tqdm opentele tomli
+pip install telethon tqdm opentele tomli pysocks
 ```
 
 ## Конфигурация
