@@ -271,6 +271,14 @@ class SourceItem:
 
 
 @dataclass
+class SourceError:
+    """Описание ошибки при поиске входных источников."""
+
+    path: Path
+    error: str
+
+
+@dataclass
 class ApiPair:
     api_id: int
     api_hash: str
@@ -458,7 +466,7 @@ def detect_source(path: Path) -> SourceItem:
 # ---------------------------------------------------------------------------
 
 
-def discover_sources(root: Path) -> List[SourceItem]:
+def discover_sources(root: Path, errors: Optional[List[SourceError]] = None) -> List[SourceItem]:
     """Рекурсивно находит поддерживаемые источники внутри каталога."""
 
     path = root.expanduser()
@@ -478,15 +486,31 @@ def discover_sources(root: Path) -> List[SourceItem]:
         seen.add(resolved)
         sources.append(item)
 
+    def register_error(target: Path, message: str) -> None:
+        logging.warning("Источник %s пропущен: %s", target, message)
+        if errors is not None:
+            errors.append(SourceError(target, message))
+
     def walk(current: Path) -> None:
         if current.is_symlink():
+            register_error(current, "символическая ссылка")
             return
+
         if current.is_file():
             suffix = current.suffix.lower()
             if suffix == ".session":
                 add(SourceItem(current, SourceType.TELETHON_SESSION_FILE, current.stem))
             elif suffix in {".csv", ".txt"}:
                 add(SourceItem(current, SourceType.STRING_SESSION_CSV, current.stem))
+            return
+
+        try:
+            session_candidates = list(current.glob("*.session"))
+        except OSError as exc:
+            register_error(current, str(exc))
+            return
+        if session_candidates:
+            add(SourceItem(current, SourceType.TELETHON_SESSION_DIR, current.name))
             return
 
         if looks_like_tdata(current):
@@ -496,21 +520,24 @@ def discover_sources(root: Path) -> List[SourceItem]:
         try:
             entries = sorted(current.iterdir(), key=lambda p: p.name.lower())
         except OSError as exc:
-            logging.warning("Не удалось перечислить %s: %s", current, exc)
+            register_error(current, str(exc))
             return
 
         for entry in entries:
-            if entry.is_dir():
+            try:
                 walk(entry)
-            elif entry.is_file():
-                suffix = entry.suffix.lower()
-                if suffix == ".session":
-                    add(SourceItem(entry, SourceType.TELETHON_SESSION_FILE, entry.stem))
-                elif suffix in {".csv", ".txt"}:
-                    add(SourceItem(entry, SourceType.STRING_SESSION_CSV, entry.stem))
+            except Exception as exc:
+                if errors is None:
+                    raise
+                register_error(entry, str(exc))
 
     if path.is_file():
-        add(detect_source(path))
+        try:
+            add(detect_source(path))
+        except Exception as exc:
+            if errors is None:
+                raise
+            register_error(path, str(exc))
     else:
         walk(path)
 
@@ -1471,6 +1498,7 @@ async def handle_check(args: argparse.Namespace) -> int:
     args.concurrency = max(1, min(50, args.concurrency))
     sources: List[SourceItem] = []
     seen_paths: Set[Path] = set()
+    discovery_errors: List[SourceError] = []
 
     def add_source(item: SourceItem) -> None:
         try:
@@ -1485,15 +1513,21 @@ async def handle_check(args: argparse.Namespace) -> int:
     def extend_with_path(raw: str, only_tdata: bool = False) -> None:
         path = Path(raw).expanduser()
         if only_tdata and not path.is_dir():
-            logging.error("Каталог с tdata не найден: %s", path)
+            message = "Каталог с tdata не найден"
+            logging.error("%s: %s", message, path)
+            discovery_errors.append(SourceError(path, message))
             return
         try:
-            discovered = discover_sources(path)
+            discovered = discover_sources(path, discovery_errors)
         except FileNotFoundError:
-            logging.error("Источник %s не найден", path)
+            message = "Источник не найден"
+            logging.error("%s: %s", message, path)
+            discovery_errors.append(SourceError(path, message))
             return
         except Exception as exc:
-            logging.error("Не удалось обработать источник %s: %s", raw, exc)
+            message = f"Не удалось обработать источник: {exc}"
+            logging.error("%s (%s)", message, raw)
+            discovery_errors.append(SourceError(path, message))
             return
 
         added = 0
@@ -1505,14 +1539,15 @@ async def handle_check(args: argparse.Namespace) -> int:
 
         if added == 0:
             if only_tdata:
-                logging.warning(
-                    "В каталоге %s не найдено поддиректорий, похожих на tdata",
-                    path,
+                message = (
+                    "В каталоге не найдено поддиректорий, похожих на tdata"
                 )
+                logging.warning("%s: %s", message, path)
+                discovery_errors.append(SourceError(path, message))
             else:
-                logging.warning(
-                    "Источник %s не содержит поддерживаемых файлов", path
-                )
+                message = "Источник не содержит поддерживаемых файлов"
+                logging.warning("%s: %s", message, path)
+                discovery_errors.append(SourceError(path, message))
 
     all_inputs = list(args.inputs)
     if args.session_dir:
@@ -1524,21 +1559,54 @@ async def handle_check(args: argparse.Namespace) -> int:
     if args.tdata_root:
         extend_with_path(args.tdata_root, only_tdata=True)
 
-    if not sources:
+    if not sources and not discovery_errors:
         logging.error("Не найдено корректных источников для проверки")
         return 1
 
     tasks, conversions = await prepare_tasks(args, sources)
     write_convert_report(conversions, Path(args.convert_out))
-    if not tasks:
+
+    error_tasks: List[Tuple[str, Optional[str], Optional[Path]]] = []
+    error_results: List[CheckResult] = []
+    seen_error_keys: Set[str] = set()
+    for issue in discovery_errors:
+        key = f"source_error:{issue.path}"
+        if key in seen_error_keys:
+            continue
+        seen_error_keys.add(key)
+        error_tasks.append((key, None, None))
+        error_results.append(
+            CheckResult(
+                key,
+                False,
+                f"source_error:{issue.error}",
+                None,
+                None,
+                None,
+                None,
+                datetime.utcnow().isoformat(),
+                None,
+                None,
+                None,
+                0,
+                0.0,
+            )
+        )
+
+    if not tasks and not error_results:
         logging.error("Нет сессий для проверки")
         return 1
 
-    if args.dry_run:
+    if args.dry_run and tasks:
         logging.info("Режим dry-run: сетевые запросы выполняться не будут")
 
-    results = await run_checker(args, tasks)
-    generate_reports(results, tasks, Path(args.out))
+    results: List[CheckResult] = []
+    if tasks:
+        results = await run_checker(args, tasks)
+
+    results.extend(error_results)
+    all_tasks = list(tasks) + error_tasks
+    generate_reports(results, all_tasks, Path(args.out))
     return 0
 
 
